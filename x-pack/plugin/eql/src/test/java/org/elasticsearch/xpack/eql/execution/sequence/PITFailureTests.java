@@ -7,7 +7,6 @@
 
 package org.elasticsearch.xpack.eql.execution.sequence;
 
-import org.apache.lucene.search.TotalHits;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.ActionRequest;
 import org.elasticsearch.action.ActionResponse;
@@ -108,7 +107,7 @@ public class PITFailureTests extends ESTestCase {
                 )
             );
             IndexResolver indexResolver = new IndexResolver(esClient, "cluster", DefaultDataTypeRegistry.INSTANCE, () -> emptySet());
-            CircuitBreaker cb = new NoopCircuitBreaker("testcb");
+            CircuitBreaker cb = NoopCircuitBreaker.INSTANCE;
             EqlSession eqlSession = new EqlSession(
                 esClient,
                 eqlConfiguration,
@@ -167,12 +166,11 @@ public class PITFailureTests extends ESTestCase {
      * must not be propagated back to the outer listener, which has already been invoked.
      */
     public void testCloseFailureDoesNotInvokeListenerTwice() {
-        CircuitBreaker cb = new NoopCircuitBreaker("testcb");
+        CircuitBreaker cb = NoopCircuitBreaker.INSTANCE;
         QueryClient client = new QueryClient() {
             @Override
             public void query(QueryRequest r, ActionListener<SearchResponse> l) {
-                SearchHits hits = SearchHits.unpooled(SearchHits.EMPTY, new TotalHits(0, TotalHits.Relation.EQUAL_TO), 0.0f);
-                ActionListener.respondAndRelease(l, SearchResponseUtils.successfulResponse(hits));
+                ActionListener.respondAndRelease(l, SearchResponseUtils.successfulResponse(SearchHits.EMPTY_WITH_TOTAL_HITS));
             }
 
             @Override
@@ -228,7 +226,7 @@ public class PITFailureTests extends ESTestCase {
      * must be swallowed/logged rather than re-delivered.
      */
     public void testQueryAndCloseFailureDoesNotInvokeListenerTwice() {
-        CircuitBreaker cb = new NoopCircuitBreaker("testcb");
+        CircuitBreaker cb = NoopCircuitBreaker.INSTANCE;
         QueryClient client = new QueryClient() {
             @Override
             public void query(QueryRequest r, ActionListener<SearchResponse> l) {

@@ -7,8 +7,6 @@
 
 package org.elasticsearch.xpack.inference.external.http.sender;
 
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 import org.elasticsearch.ElasticsearchStatusException;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.support.ContextPreservingActionListener;
@@ -18,6 +16,8 @@ import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.inference.InferenceServiceResults;
+import org.elasticsearch.logging.LogManager;
+import org.elasticsearch.logging.Logger;
 import org.elasticsearch.rest.RestStatus;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.xpack.inference.external.http.HttpClientManager;
@@ -26,7 +26,7 @@ import org.elasticsearch.xpack.inference.external.http.retry.RequestSender;
 import org.elasticsearch.xpack.inference.external.http.retry.ResponseHandler;
 import org.elasticsearch.xpack.inference.external.http.retry.RetrySettings;
 import org.elasticsearch.xpack.inference.external.http.retry.RetryingHttpSender;
-import org.elasticsearch.xpack.inference.external.request.Request;
+import org.elasticsearch.xpack.inference.external.request.OutboundRequest;
 import org.elasticsearch.xpack.inference.services.ServiceComponents;
 
 import java.io.IOException;
@@ -61,7 +61,12 @@ public class HttpRequestSender implements Sender {
             var executorServiceSettings = new RequestExecutorServiceSettings(serviceComponents.settings());
             executorServiceSettings.init(clusterService);
 
-            var service = new RequestExecutorService(serviceComponents.threadPool(), executorServiceSettings, requestSender);
+            var service = new RequestExecutorService(
+                serviceComponents.threadPool(),
+                executorServiceSettings,
+                requestSender,
+                serviceComponents.circuitBreaker()
+            );
 
             httpRequestSender = new HttpRequestSender(serviceComponents.threadPool(), httpClientManager, requestSender, service);
         }
@@ -193,14 +198,14 @@ public class HttpRequestSender implements Sender {
      * Startup is initiated automatically if it has not already been started.
      *
      * @param logger          A logger to use for messages
-     * @param request         A request to be sent
+     * @param outboundRequest         A request to be sent
      * @param responseHandler A handler for parsing the response
      * @param timeout         the maximum time the request should wait for a response before timing out. If null, the timeout is ignored
      * @param listener        a listener to handle the response
      */
     public void sendWithoutQueuing(
         Logger logger,
-        Request request,
+        OutboundRequest outboundRequest,
         ResponseHandler responseHandler,
         @Nullable TimeValue timeout,
         ActionListener<InferenceServiceResults> listener
@@ -208,10 +213,16 @@ public class HttpRequestSender implements Sender {
         SubscribableListener.<Void>newForked(startListener -> startAsynchronously(startListener, STARTUP_TIMEOUT))
             .<InferenceServiceResults>andThen(sendListener -> {
                 var preservedListener = ContextPreservingActionListener.wrapPreservingContext(sendListener, threadPool.getThreadContext());
-                var timedListener = new TimedListener<>(timeout, preservedListener, threadPool, request.getInferenceEntityId());
+                var timedListener = new TimedListener<>(timeout, preservedListener, threadPool, outboundRequest.getInferenceEntityId());
                 threadPool.executor(UTILITY_THREAD_POOL_NAME)
                     .execute(
-                        () -> requestSender.send(logger, request, timedListener::hasCompleted, responseHandler, timedListener.getListener())
+                        () -> requestSender.send(
+                            logger,
+                            outboundRequest,
+                            timedListener::hasCompleted,
+                            responseHandler,
+                            timedListener.getListener()
+                        )
                     );
             })
             .addListener(listener);

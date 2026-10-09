@@ -13,7 +13,21 @@
 #include <arm_sve.h>
 #include "vec.h"
 #include "vec_common.h"
+#include "vec_bf16_1.h"
 #include "aarch64/aarch64_vec_common.h"
+
+/*
+ * We only have bf16-bf16 implementations in SVE, not f32-bf16.
+ * In SVE we can use BFDOT to calculate the dot product of two bf16-bf16 vectors,
+ * but for f32-bf16 we need to convert to f32 first.
+ * NEON has the fast USHLL instruction, but because SVE doesn't specify vector widths explicitly,
+ * we can't easily process a 'half-width' bf16 vector.
+ * Instead, we would need to use the more expensive UUNPK + LSL instructions to convert bf16 to f32.
+ *
+ * This means that an SVE implementation is the same speed as
+ * or slower than NEON on all relevant processors (as of 2026),
+ * so just use the NEON implementation for f32-bf16.
+ */
 
 static inline f32_t dotDbf16Qbf16_inner_sve(const bfloat16_t* d, const bfloat16_t* q, const int32_t elementCount) {
     constexpr int batches = 8;
@@ -173,7 +187,9 @@ static inline f32_t sqrDbf16Qbf16_inner_sve(const bfloat16_t* d, const bfloat16_
     }
 
     // |a - b|^2 = a*a - 2*a*b + b*b
-    return svaddv_f32(all32, sum_self) - 2.0f * svaddv_f32(all32, sum_cross);
+    const f32_t self = svaddv_f32(all32, sum_self);
+    const f32_t result = self - 2.0f * svaddv_f32(all32, sum_cross);
+    return sqr_bf16_recompute_if_needed(self, result, (const bf16_t*)d, (const bf16_t*)q, elementCount);
 }
 
 EXPORT f32_t vec_sqrDbf16Qbf16_2(const bf16_t* a, const bf16_t* b, const int32_t elementCount) {
@@ -382,14 +398,22 @@ static inline void sqrDbf16Qbf16_bulk_sve(
 
         const svbool_t all32 = svptrue_b32();
         f32_t final_bb = svaddv_f32(all32, sum_bb);
-        results[c + 0] = svaddv_f32(all32, sum_aa0) + final_bb - 2.0f * svaddv_f32(all32, sum_ab0);
-        results[c + 1] = svaddv_f32(all32, sum_aa1) + final_bb - 2.0f * svaddv_f32(all32, sum_ab1);
-        results[c + 2] = svaddv_f32(all32, sum_aa2) + final_bb - 2.0f * svaddv_f32(all32, sum_ab2);
-        results[c + 3] = svaddv_f32(all32, sum_aa3) + final_bb - 2.0f * svaddv_f32(all32, sum_ab3);
-        results[c + 4] = svaddv_f32(all32, sum_aa4) + final_bb - 2.0f * svaddv_f32(all32, sum_ab4);
-        results[c + 5] = svaddv_f32(all32, sum_aa5) + final_bb - 2.0f * svaddv_f32(all32, sum_ab5);
-        results[c + 6] = svaddv_f32(all32, sum_aa6) + final_bb - 2.0f * svaddv_f32(all32, sum_ab6);
-        results[c + 7] = svaddv_f32(all32, sum_aa7) + final_bb - 2.0f * svaddv_f32(all32, sum_ab7);
+        const f32_t self0 = svaddv_f32(all32, sum_aa0) + final_bb;
+        const f32_t self1 = svaddv_f32(all32, sum_aa1) + final_bb;
+        const f32_t self2 = svaddv_f32(all32, sum_aa2) + final_bb;
+        const f32_t self3 = svaddv_f32(all32, sum_aa3) + final_bb;
+        const f32_t self4 = svaddv_f32(all32, sum_aa4) + final_bb;
+        const f32_t self5 = svaddv_f32(all32, sum_aa5) + final_bb;
+        const f32_t self6 = svaddv_f32(all32, sum_aa6) + final_bb;
+        const f32_t self7 = svaddv_f32(all32, sum_aa7) + final_bb;
+        results[c + 0] = sqr_bf16_recompute_if_needed(self0, self0 - 2.0f * svaddv_f32(all32, sum_ab0), (const bf16_t*)a0, b, dims);
+        results[c + 1] = sqr_bf16_recompute_if_needed(self1, self1 - 2.0f * svaddv_f32(all32, sum_ab1), (const bf16_t*)a1, b, dims);
+        results[c + 2] = sqr_bf16_recompute_if_needed(self2, self2 - 2.0f * svaddv_f32(all32, sum_ab2), (const bf16_t*)a2, b, dims);
+        results[c + 3] = sqr_bf16_recompute_if_needed(self3, self3 - 2.0f * svaddv_f32(all32, sum_ab3), (const bf16_t*)a3, b, dims);
+        results[c + 4] = sqr_bf16_recompute_if_needed(self4, self4 - 2.0f * svaddv_f32(all32, sum_ab4), (const bf16_t*)a4, b, dims);
+        results[c + 5] = sqr_bf16_recompute_if_needed(self5, self5 - 2.0f * svaddv_f32(all32, sum_ab5), (const bf16_t*)a5, b, dims);
+        results[c + 6] = sqr_bf16_recompute_if_needed(self6, self6 - 2.0f * svaddv_f32(all32, sum_ab6), (const bf16_t*)a6, b, dims);
+        results[c + 7] = sqr_bf16_recompute_if_needed(self7, self7 - 2.0f * svaddv_f32(all32, sum_ab7), (const bf16_t*)a7, b, dims);
     }
 
     // vectors tail

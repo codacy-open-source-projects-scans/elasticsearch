@@ -10,44 +10,42 @@
 package org.elasticsearch.simdvec.internal;
 
 import org.apache.lucene.index.FloatVectorValues;
-import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.VectorUtil;
 import org.apache.lucene.util.hnsw.RandomVectorScorerSupplier;
 import org.apache.lucene.util.hnsw.UpdateableRandomVectorScorer;
+import org.elasticsearch.lucene.store.IndexInputUtils;
+import org.elasticsearch.simdvec.SimdVecLibrary;
 
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 
-import static org.apache.lucene.index.VectorSimilarityFunction.DOT_PRODUCT;
-import static org.apache.lucene.index.VectorSimilarityFunction.EUCLIDEAN;
-import static org.apache.lucene.index.VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT;
-
 public abstract class BFloat16VectorScorerSupplier implements RandomVectorScorerSupplier {
+
+    private static final SimdVecLibrary DISTANCE_FUNCS = SimdVecLibrary.instance().orElseThrow(AssertionError::new);
 
     final int dims;
     final int vectorByteSize;
-    final int maxOrd;
     final IndexInput input;
     final FloatVectorValues values;
-    final VectorSimilarityFunction fallbackScorer;
     final FixedSizeScratch firstScratch;
     final FixedSizeScratch secondScratch;
+    final AddressesScratch addrsScratch = new AddressesScratch();
+    final OffsetsScratch offsetsScratch = new OffsetsScratch();
+    final float[] maxScore = new float[] { Float.NEGATIVE_INFINITY };
 
-    protected BFloat16VectorScorerSupplier(IndexInput input, FloatVectorValues values, VectorSimilarityFunction fallbackScorer) {
+    protected BFloat16VectorScorerSupplier(IndexInput input, FloatVectorValues values) {
         this.input = input;
         this.values = values;
         this.dims = values.dimension();
         this.vectorByteSize = values.getVectorByteLength();
-        this.maxOrd = values.size();
-        this.fallbackScorer = fallbackScorer;
         this.firstScratch = new FixedSizeScratch(vectorByteSize);
         this.secondScratch = new FixedSizeScratch(vectorByteSize);
     }
 
     protected final void checkOrdinal(int ord) {
-        if (ord < 0 || ord > maxOrd) {
+        if (ord < 0 || ord >= values.size()) {
             throw new IllegalArgumentException("illegal ordinal: " + ord);
         }
     }
@@ -59,30 +57,37 @@ public abstract class BFloat16VectorScorerSupplier implements RandomVectorScorer
 
         long queryByteOffset = (long) firstOrd * vectorByteSize;
         input.seek(queryByteOffset);
-        return IndexInputUtils.withSlice(input, vectorByteSize, firstScratch::getScratch, query -> {
-            long[] offsets = new long[numNodes];
+        return IndexInputUtils.withFloatSlice(input, vectorByteSize, firstScratch, query -> {
+            long[] offsets = offsetsScratch.get(numNodes);
             for (int i = 0; i < numNodes; i++) {
                 offsets[i] = (long) ordinals[i] * vectorByteSize;
             }
 
-            float[] maxScore = new float[] { Float.NEGATIVE_INFINITY };
+            maxScore[0] = Float.NEGATIVE_INFINITY;
             boolean resolved = IndexInputUtils.withSliceAddresses(
                 input,
                 offsets,
                 vectorByteSize,
                 numNodes,
+                addrsScratch,
                 addrs -> maxScore[0] = bulkScoreFromSegment(addrs, query, MemorySegment.ofArray(scores), numNodes)
             );
             if (resolved == false) {
-                // fallback to on-heap fallback scorer
-                var queryVector = values.vectorValue(firstOrd).clone();
-                for (int i = 0; i < numNodes; i++) {
-                    scores[i] = fallbackScorer.compare(queryVector, values.vectorValue(ordinals[i]));
-                    maxScore[0] = Math.max(maxScore[0], scores[i]);
-                }
+                return scorePerVectorFallback(query, scores, numNodes, offsets);
             }
             return maxScore[0];
         });
+    }
+
+    private float scorePerVectorFallback(MemorySegment query, float[] scores, int numNodes, long[] offsets) throws IOException {
+        float maxScore = Float.NEGATIVE_INFINITY;
+        for (int i = 0; i < numNodes; i++) {
+            final int idx = i;
+            input.seek(offsets[idx]);
+            IndexInputUtils.withVoidSlice(input, vectorByteSize, secondScratch, vector -> scores[idx] = scoreFromSegments(query, vector));
+            maxScore = Math.max(maxScore, scores[idx]);
+        }
+        return maxScore;
     }
 
     final float scoreFromOrds(int firstOrd, int secondOrd) throws IOException {
@@ -90,12 +95,12 @@ public abstract class BFloat16VectorScorerSupplier implements RandomVectorScorer
         long secondByteOffset = (long) secondOrd * vectorByteSize;
 
         input.seek(firstByteOffset);
-        return IndexInputUtils.withSlice(input, vectorByteSize, firstScratch::getScratch, firstSeg -> {
+        return IndexInputUtils.withFloatSlice(input, vectorByteSize, firstScratch, firstSeg -> {
             input.seek(secondByteOffset);
-            return IndexInputUtils.withSlice(
+            return IndexInputUtils.withFloatSlice(
                 input,
                 vectorByteSize,
-                secondScratch::getScratch,
+                secondScratch,
                 secondSeg -> scoreFromSegments(firstSeg, secondSeg)
             );
         });
@@ -132,17 +137,17 @@ public abstract class BFloat16VectorScorerSupplier implements RandomVectorScorer
     public static final class EuclideanSupplier extends BFloat16VectorScorerSupplier {
 
         public EuclideanSupplier(IndexInput input, FloatVectorValues values) {
-            super(input, values, EUCLIDEAN);
+            super(input, values);
         }
 
         @Override
         float scoreFromSegments(MemorySegment a, MemorySegment b) {
-            return VectorUtil.normalizeDistanceToUnitInterval(Similarities.squareDistanceDBF16QBF16(a, b, dims));
+            return VectorUtil.normalizeDistanceToUnitInterval(DISTANCE_FUNCS.squareDistanceDBF16QBF16(a, b, dims));
         }
 
         @Override
         protected float bulkScoreFromSegment(MemorySegment addresses, MemorySegment query, MemorySegment scores, int numNodes) {
-            Similarities.squareDistanceDBF16QBF16BulkSparse(addresses, query, dims, numNodes, scores);
+            DISTANCE_FUNCS.squareDistanceDBF16QBF16BulkSparse(addresses, query, dims, numNodes, scores);
 
             float max = Float.NEGATIVE_INFINITY;
             for (int i = 0; i < numNodes; ++i) {
@@ -163,17 +168,17 @@ public abstract class BFloat16VectorScorerSupplier implements RandomVectorScorer
     public static final class DotProductSupplier extends BFloat16VectorScorerSupplier {
 
         public DotProductSupplier(IndexInput input, FloatVectorValues values) {
-            super(input, values, DOT_PRODUCT);
+            super(input, values);
         }
 
         @Override
         float scoreFromSegments(MemorySegment a, MemorySegment b) {
-            return VectorUtil.normalizeToUnitInterval(Similarities.dotProductDBF16QBF16(a, b, dims));
+            return VectorUtil.normalizeToUnitInterval(DISTANCE_FUNCS.dotProductDBF16QBF16(a, b, dims));
         }
 
         @Override
         protected float bulkScoreFromSegment(MemorySegment addresses, MemorySegment query, MemorySegment scores, int numNodes) {
-            Similarities.dotProductDBF16QBF16BulkSparse(addresses, query, dims, numNodes, scores);
+            DISTANCE_FUNCS.dotProductDBF16QBF16BulkSparse(addresses, query, dims, numNodes, scores);
 
             float max = Float.NEGATIVE_INFINITY;
             for (int i = 0; i < numNodes; ++i) {
@@ -194,17 +199,17 @@ public abstract class BFloat16VectorScorerSupplier implements RandomVectorScorer
     public static final class MaxInnerProductSupplier extends BFloat16VectorScorerSupplier {
 
         public MaxInnerProductSupplier(IndexInput input, FloatVectorValues values) {
-            super(input, values, MAXIMUM_INNER_PRODUCT);
+            super(input, values);
         }
 
         @Override
         float scoreFromSegments(MemorySegment a, MemorySegment b) {
-            return VectorUtil.scaleMaxInnerProductScore(Similarities.dotProductDBF16QBF16(a, b, dims));
+            return VectorUtil.scaleMaxInnerProductScore(DISTANCE_FUNCS.dotProductDBF16QBF16(a, b, dims));
         }
 
         @Override
         protected float bulkScoreFromSegment(MemorySegment addresses, MemorySegment query, MemorySegment scores, int numNodes) {
-            Similarities.dotProductDBF16QBF16BulkSparse(addresses, query, dims, numNodes, scores);
+            DISTANCE_FUNCS.dotProductDBF16QBF16BulkSparse(addresses, query, dims, numNodes, scores);
 
             float max = Float.NEGATIVE_INFINITY;
             for (int i = 0; i < numNodes; ++i) {

@@ -10,6 +10,7 @@ package org.elasticsearch.xpack.esql.qa.rest.generative;
 import org.elasticsearch.client.Request;
 import org.elasticsearch.client.RequestOptions;
 import org.elasticsearch.client.Response;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.xpack.esql.generator.Column;
 import org.elasticsearch.xpack.esql.generator.EsqlQueryGenerator;
 import org.elasticsearch.xpack.esql.generator.QueryExecuted;
@@ -24,6 +25,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 /**
@@ -58,16 +60,24 @@ public abstract class GenerativeRandomMappingRestTest extends GenerativeRestTest
 
     private static volatile List<GeneratedIndex> generatedIndices;
 
-    private static final Pattern CANNOT_LOAD_BLOCKS_WITHOUT_DOC_VALUES = Pattern.compile(
-        ".*Cannot load blocks without doc values.*",
-        Pattern.DOTALL
-    );
-
     // FORK converts UnsupportedAttribute to a plain ReferenceAttribute(UNSUPPORTED), stripping the
     // Unresolvable marker. Functions then reject the argument with a generic "type [unsupported]" error
     // instead of the proper "Cannot use field" message. https://github.com/elastic/elasticsearch/issues/147094
     private static final Pattern UNSUPPORTED_TYPE_IN_FUNCTION = Pattern.compile(
         ".*argument of \\[.*\\] must be \\[.*\\], found value \\[.*\\] type \\[unsupported\\].*",
+        Pattern.DOTALL
+    );
+
+    // Full-text functions (match, match_phrase, qstr) pushed down to Lucene can fail with
+    // "failed to create query" on random mappings where field types are incompatible (e.g., non-indexed
+    // fields, numeric fields receiving text input). https://github.com/elastic/elasticsearch/issues/147610
+    private static final Pattern FAILED_TO_CREATE_QUERY = Pattern.compile(".*failed to create query.*", Pattern.DOTALL);
+
+    // LIKE/RLIKE/STARTS_WITH/ENDS_WITH/CONTAINS (and full-text with fuzziness) can be pushed to Lucene against a keyed subfield
+    // of a flattened field, e.g. "size.raw" when one unioned index maps "size" as flattened. The flattened field type rejects
+    // wildcard/regexp/fuzzy on keyed subfields by design; ES|QL does not yet gate this pushdown (unlike the field_extract path).
+    private static final Pattern KEYED_FLATTENED_QUERY_UNSUPPORTED = Pattern.compile(
+        ".*queries are not currently supported on keyed \\[flattened\\] fields.*",
         Pattern.DOTALL
     );
 
@@ -99,7 +109,7 @@ public abstract class GenerativeRandomMappingRestTest extends GenerativeRestTest
     @Override
     public void test() throws IOException {
         List<String> names = indexNames();
-        CommandGenerator.QuerySchema schema = new CommandGenerator.QuerySchema(names, List.of(), List.of());
+        CommandGenerator.QuerySchema schema = new CommandGenerator.QuerySchema(names, List.of(), List.of(), Set.of());
 
         for (int i = 0; i < RM_ITERATIONS; i++) {
             var exec = new EsqlQueryGenerator.Executor() {
@@ -155,12 +165,7 @@ public abstract class GenerativeRandomMappingRestTest extends GenerativeRestTest
                 QueryExecuted previousResult;
             };
             try {
-                EsqlQueryGenerator.generatePipeline(RM_MAX_DEPTH, sourceCommand(), schema, exec, false, this);
-            } catch (AssertionError ae) {
-                // Thrown by checkPipelineResults/checkPipelineException via fail();
-                // augment with full reproduction context.
-                String query = exec.previousResult != null ? exec.previousResult.query() : null;
-                throw new AssertionError(ae.getMessage() + formatReproductionContext(query), ae.getCause() != null ? ae.getCause() : ae);
+                EsqlQueryGenerator.generatePipeline(RM_MAX_DEPTH, sourceCommand(), schema, exec, false, this, rootGenerationContext());
             } catch (Exception e) {
                 String errorMessage = e.getMessage();
                 String query = exec.previousResult != null ? exec.previousResult.query() : null;
@@ -168,7 +173,7 @@ public abstract class GenerativeRandomMappingRestTest extends GenerativeRestTest
                     continue;
                 }
                 throw new AssertionError(
-                    "Random mapping generative tests, error generating new command" + formatReproductionContext(query),
+                    "Random mapping generative tests, error generating new command\n" + failureReport(query, errorMessage),
                     e
                 );
             }
@@ -221,31 +226,22 @@ public abstract class GenerativeRandomMappingRestTest extends GenerativeRestTest
 
     private static boolean isAdditionalAllowedError(String errorMessage, String query) {
         if (errorMessage == null) return false;
-        // RangeFieldMapper throws "Cannot load blocks without doc values" for *_range fields
-        // with doc_values:false. https://github.com/elastic/elasticsearch/issues/146527
-        if (isAllowedError(errorMessage, CANNOT_LOAD_BLOCKS_WITHOUT_DOC_VALUES) && hasRangeFieldType()) {
-            return true;
-        }
         // FORK converts UnsupportedAttribute to ReferenceAttribute(UNSUPPORTED), causing functions
         // to reject the field with a generic "type [unsupported]" error.
         // https://github.com/elastic/elasticsearch/issues/147094
         if (query != null && isAllowedError(errorMessage, UNSUPPORTED_TYPE_IN_FUNCTION) && queryContainsFork(query)) {
             return true;
         }
-        return false;
-    }
-
-    private static boolean hasRangeFieldType() {
-        List<GeneratedIndex> indices = generatedIndices;
-        if (indices == null) {
-            return false;
+        // Full-text functions pushed to Lucene can throw QueryShardException("failed to create query: ...")
+        // when the target field has an incompatible type or is not indexed in the random mapping.
+        // https://github.com/elastic/elasticsearch/issues/147610
+        if (query != null && isAllowedError(errorMessage, FAILED_TO_CREATE_QUERY) && queryContainsFullTextFunction(query)) {
+            return true;
         }
-        for (GeneratedIndex idx : indices) {
-            for (RandomMappingGenerator.FieldDef field : idx.fields()) {
-                if (field.esType().endsWith("_range")) {
-                    return true;
-                }
-            }
+        // This message is produced only by the flattened field type, so match on it directly without a query guard; a guard on
+        // the pattern functions would miss the fuzzy variant that full-text functions can push to a keyed flattened subfield.
+        if (isAllowedError(errorMessage, KEYED_FLATTENED_QUERY_UNSUPPORTED)) {
+            return true;
         }
         return false;
     }
@@ -254,7 +250,25 @@ public abstract class GenerativeRandomMappingRestTest extends GenerativeRestTest
         return query != null && query.toUpperCase(Locale.ROOT).contains("FORK");
     }
 
-    private static String formatReproductionContext(String query) {
+    private static boolean queryContainsFullTextFunction(String query) {
+        if (query == null) {
+            return false;
+        }
+        String upper = query.toUpperCase(Locale.ROOT);
+        return upper.contains("MATCH(") || upper.contains("MATCH_PHRASE(") || upper.contains("QSTR(") || upper.contains("KQL(");
+    }
+
+    /**
+     * Appends the mappings and documents of this run's randomly generated indices, which a seed alone does not
+     * reproduce once the generator changes.
+     */
+    @Override
+    protected String failureReport(@Nullable String query, @Nullable String error) {
+        return super.failureReport(query, error) + formatReproductionContext(query);
+    }
+
+    /** The generated indices and the failing query, as ready-to-paste REST commands. */
+    private static String formatReproductionContext(@Nullable String query) {
         List<GeneratedIndex> indices = generatedIndices;
         if (indices == null) {
             return "";

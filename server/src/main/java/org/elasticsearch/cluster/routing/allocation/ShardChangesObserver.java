@@ -14,6 +14,7 @@ import org.apache.logging.log4j.Logger;
 import org.elasticsearch.cluster.routing.RoutingChangesObserver;
 import org.elasticsearch.cluster.routing.ShardRouting;
 import org.elasticsearch.cluster.routing.UnassignedInfo;
+import org.elasticsearch.cluster.routing.allocation.allocator.BalancedShardsAllocator;
 import org.elasticsearch.telemetry.metric.LongCounter;
 import org.elasticsearch.telemetry.metric.LongHistogram;
 import org.elasticsearch.telemetry.metric.MeterRegistry;
@@ -22,10 +23,6 @@ import java.util.Arrays;
 import java.util.Map;
 import java.util.function.LongSupplier;
 import java.util.stream.Collectors;
-
-import static org.elasticsearch.cluster.routing.allocation.allocator.BalancedShardsAllocator.MOVE_CANNOT_REMAIN_REASON;
-import static org.elasticsearch.cluster.routing.allocation.allocator.BalancedShardsAllocator.MOVE_NOT_PREFERRED_REASON;
-import static org.elasticsearch.cluster.routing.allocation.allocator.BalancedShardsAllocator.REBALANCE_REASON;
 
 /// Observes shard state transitions during allocation rounds, logging them and emitting APM timing metrics.
 class ShardChangesObserver implements RoutingChangesObserver {
@@ -39,18 +36,23 @@ class ShardChangesObserver implements RoutingChangesObserver {
     private static final Map<UnassignedInfo.Reason, Map<String, Object>> PRIMARY_ATTRIBUTES = buildAttributesByReason(true);
     private static final Map<UnassignedInfo.Reason, Map<String, Object>> REPLICA_ATTRIBUTES = buildAttributesByReason(false);
     // Pre-calculate attributes for the most common move reasons
-    static final Map<String, Map<String, Object>> RELOCATION_ATTRIBUTES = Map.of(
-        REBALANCE_REASON,
-        Map.of("es_relocation_reason", REBALANCE_REASON),
-        MOVE_CANNOT_REMAIN_REASON,
-        Map.of("es_relocation_reason", MOVE_CANNOT_REMAIN_REASON),
-        MOVE_NOT_PREFERRED_REASON,
-        Map.of("es_relocation_reason", MOVE_NOT_PREFERRED_REASON)
-    );
+    static final Map<String, Map<String, Object>> PRIMARY_RELOCATION_ATTRIBUTES = buildRelocationAttributes(true);
+    static final Map<String, Map<String, Object>> REPLICA_RELOCATION_ATTRIBUTES = buildRelocationAttributes(false);
 
     private static Map<UnassignedInfo.Reason, Map<String, Object>> buildAttributesByReason(boolean primary) {
         return Arrays.stream(UnassignedInfo.Reason.values())
             .collect(Collectors.toUnmodifiableMap(r -> r, r -> Map.of("es_shard_primary", primary, "es_shard_reason", r.name())));
+    }
+
+    private static Map<String, Map<String, Object>> buildRelocationAttributes(boolean primary) {
+        return Map.of(
+            BalancedShardsAllocator.MoveType.REBALANCE.reason(),
+            Map.of("es_relocation_reason", BalancedShardsAllocator.MoveType.REBALANCE.reason(), "es_shard_primary", primary),
+            BalancedShardsAllocator.MoveType.CANNOT_REMAIN.reason(),
+            Map.of("es_relocation_reason", BalancedShardsAllocator.MoveType.CANNOT_REMAIN.reason(), "es_shard_primary", primary),
+            BalancedShardsAllocator.MoveType.NOT_PREFERRED.reason(),
+            Map.of("es_relocation_reason", BalancedShardsAllocator.MoveType.NOT_PREFERRED.reason(), "es_shard_primary", primary)
+        );
     }
 
     private final LongHistogram unassignedToInitializingDuration;
@@ -129,15 +131,15 @@ class ShardChangesObserver implements RoutingChangesObserver {
             startedShard.currentNodeId(),
             targetRelocatingShard.currentNodeId()
         );
-        relocationStartedCounter.incrementBy(1, relocationAttributes(reason));
+        relocationStartedCounter.incrementBy(1, relocationAttributes(reason, startedShard.primary()));
     }
 
-    private static Map<String, Object> relocationAttributes(String reason) {
-        final var attrs = RELOCATION_ATTRIBUTES.get(reason);
+    private static Map<String, Object> relocationAttributes(String reason, boolean primary) {
+        final var attrs = (primary ? PRIMARY_RELOCATION_ATTRIBUTES : REPLICA_RELOCATION_ATTRIBUTES).get(reason);
         if (attrs != null) {
             return attrs;
         }
-        return Map.of("es_relocation_reason", reason);
+        return Map.of("es_relocation_reason", reason, "es_shard_primary", primary);
     }
 
     @Override

@@ -6,6 +6,7 @@
  */
 package org.elasticsearch.xpack.core.ml.datafeed;
 
+import org.elasticsearch.TransportVersion;
 import org.elasticsearch.action.search.SearchRequest;
 import org.elasticsearch.action.support.IndicesOptions;
 import org.elasticsearch.cluster.ClusterState;
@@ -14,6 +15,7 @@ import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.io.stream.Writeable;
 import org.elasticsearch.core.TimeValue;
+import org.elasticsearch.core.Tuple;
 import org.elasticsearch.index.query.QueryBuilder;
 import org.elasticsearch.search.aggregations.AggregatorFactories;
 import org.elasticsearch.search.builder.SearchSourceBuilder;
@@ -39,6 +41,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * A datafeed update contains partial properties to update a {@link DatafeedConfig}.
@@ -48,6 +51,7 @@ import java.util.Objects;
 public class DatafeedUpdate implements Writeable, ToXContentObject {
 
     static final String ERROR_MESSAGE_ON_JOB_ID_UPDATE = "Datafeed's job_id cannot be changed.";
+    public static final ParseField FORCE_REKEYING = new ParseField("_force_rekeying");
 
     public static final ObjectParser<Builder, Void> PARSER = new ObjectParser<>("datafeed_update", Builder::new);
 
@@ -68,6 +72,12 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
             Builder::setQuery,
             (p, c) -> QueryProvider.fromXContent(p, false, Messages.DATAFEED_CONFIG_QUERY_BAD_FORMAT),
             DatafeedConfig.QUERY
+        );
+        PARSER.declareString(Builder::setEsqlQuery, DatafeedConfig.ESQL_QUERY);
+        PARSER.declareString(Builder::setSourceTimeField, DatafeedConfig.SOURCE_TIME_FIELD);
+        PARSER.declareString(
+            (builder, val) -> builder.setGroupingInterval(DatafeedConfig.Builder.parseFixedGroupingInterval(val)),
+            DatafeedConfig.GROUPING_INTERVAL
         );
         PARSER.declareObject(Builder::setAggregationsSafe, (p, c) -> AggProvider.fromXContent(p, false), DatafeedConfig.AGGREGATIONS);
         PARSER.declareObject(Builder::setAggregationsSafe, (p, c) -> AggProvider.fromXContent(p, false), DatafeedConfig.AGGS);
@@ -93,6 +103,8 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
             DatafeedConfig.INDICES_OPTIONS
         );
         PARSER.declareObject(Builder::setRuntimeMappings, (p, c) -> p.map(), SearchSourceBuilder.RUNTIME_MAPPINGS_FIELD);
+        PARSER.declareString(Builder::setProjectRouting, DatafeedConfig.PROJECT_ROUTING);
+        PARSER.declareBoolean(Builder::setForceRekeying, FORCE_REKEYING);
     }
 
     private final String id;
@@ -101,6 +113,10 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
     private final TimeValue frequency;
     private final List<String> indices;
     private final QueryProvider queryProvider;
+    // Kept separate from DatafeedConfig's ES|QL query: updates use it only to reject query-shape changes.
+    private final String esqlQuery;
+    private final String sourceTimeField;
+    private final TimeValue groupingInterval;
     private final AggProvider aggProvider;
     private final List<SearchSourceBuilder.ScriptField> scriptFields;
     private final Integer scrollSize;
@@ -109,6 +125,8 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
     private final Integer maxEmptySearches;
     private final IndicesOptions indicesOptions;
     private final Map<String, Object> runtimeMappings;
+    private final String projectRouting;
+    private final Boolean forceRekeying;
 
     private DatafeedUpdate(
         String id,
@@ -117,6 +135,9 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
         TimeValue frequency,
         List<String> indices,
         QueryProvider queryProvider,
+        String esqlQuery,
+        String sourceTimeField,
+        TimeValue groupingInterval,
         AggProvider aggProvider,
         List<SearchSourceBuilder.ScriptField> scriptFields,
         Integer scrollSize,
@@ -124,7 +145,9 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
         DelayedDataCheckConfig delayedDataCheckConfig,
         Integer maxEmptySearches,
         IndicesOptions indicesOptions,
-        Map<String, Object> runtimeMappings
+        Map<String, Object> runtimeMappings,
+        String projectRouting,
+        Boolean forceRekeying
     ) {
         this.id = id;
         this.jobId = jobId;
@@ -132,6 +155,9 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
         this.frequency = frequency;
         this.indices = indices;
         this.queryProvider = queryProvider;
+        this.esqlQuery = esqlQuery;
+        this.sourceTimeField = sourceTimeField;
+        this.groupingInterval = groupingInterval;
         this.aggProvider = aggProvider;
         this.scriptFields = scriptFields;
         this.scrollSize = scrollSize;
@@ -140,6 +166,8 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
         this.maxEmptySearches = maxEmptySearches;
         this.indicesOptions = indicesOptions;
         this.runtimeMappings = runtimeMappings;
+        this.projectRouting = projectRouting;
+        this.forceRekeying = forceRekeying;
     }
 
     public DatafeedUpdate(StreamInput in) throws IOException {
@@ -154,6 +182,15 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
         }
 
         this.queryProvider = in.readOptionalWriteable(QueryProvider::fromStream);
+        if (in.getTransportVersion().supports(DatafeedConfig.ML_DATAFEED_ESQL_QUERY)) {
+            this.esqlQuery = in.readOptionalString();
+            this.sourceTimeField = in.readOptionalString();
+            this.groupingInterval = in.readOptionalTimeValue();
+        } else {
+            this.esqlQuery = null;
+            this.sourceTimeField = null;
+            this.groupingInterval = null;
+        }
         this.aggProvider = in.readOptionalWriteable(AggProvider::fromStream);
 
         if (in.readBoolean()) {
@@ -167,6 +204,13 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
         maxEmptySearches = in.readOptionalInt();
         indicesOptions = in.readBoolean() ? IndicesOptions.readIndicesOptions(in) : null;
         this.runtimeMappings = in.readBoolean() ? in.readGenericMap() : null;
+        projectRouting = in.getTransportVersion().supports(DatafeedConfig.DATAFEED_PROJECT_ROUTING) ? in.readOptionalString() : null;
+        forceRekeying = in.getTransportVersion().supports(DatafeedConfig.DATAFEED_FORCE_REKEYING) ? in.readOptionalBoolean() : null;
+        if (in.getTransportVersion().supports(DatafeedConfig.DATAFEED_MAX_CONSECUTIVE_EXTRACTION_FAILURES)
+            && in.getTransportVersion().supports(DatafeedConfig.DATAFEED_MAX_CONSECUTIVE_EXTRACTION_FAILURES_REMOVED) == false) {
+            // max_consecutive_extraction_failures was removed (#158426); drain the value sent by not-yet-reverted peers
+            in.readOptionalInt();
+        }
     }
 
     /**
@@ -190,6 +234,13 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
         }
 
         out.writeOptionalWriteable(queryProvider);
+        if (out.getTransportVersion().supports(DatafeedConfig.ML_DATAFEED_ESQL_QUERY)) {
+            out.writeOptionalString(esqlQuery);
+            out.writeOptionalString(sourceTimeField);
+            out.writeOptionalTimeValue(groupingInterval);
+        } else {
+            failIfEsqlDatafeedUpdateCannotBeSerialized();
+        }
         out.writeOptionalWriteable(aggProvider);
 
         if (scriptFields != null) {
@@ -214,6 +265,27 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
         } else {
             out.writeBoolean(false);
         }
+        if (out.getTransportVersion().supports(DatafeedConfig.DATAFEED_PROJECT_ROUTING)) {
+            out.writeOptionalString(projectRouting);
+        }
+        if (out.getTransportVersion().supports(DatafeedConfig.DATAFEED_FORCE_REKEYING)) {
+            out.writeOptionalBoolean(forceRekeying);
+        }
+        if (out.getTransportVersion().supports(DatafeedConfig.DATAFEED_MAX_CONSECUTIVE_EXTRACTION_FAILURES)
+            && out.getTransportVersion().supports(DatafeedConfig.DATAFEED_MAX_CONSECUTIVE_EXTRACTION_FAILURES_REMOVED) == false) {
+            // keep the wire format aligned for not-yet-reverted peers that still read this field
+            out.writeOptionalInt(null);
+        }
+    }
+
+    private void failIfEsqlDatafeedUpdateCannotBeSerialized() throws IOException {
+        if (esqlQuery != null || sourceTimeField != null || groupingInterval != null) {
+            throw new IOException(
+                "Cannot send ES|QL datafeed update ["
+                    + id
+                    + "] to a node that does not support ES|QL datafeeds; upgrade every node before updating it."
+            );
+        }
     }
 
     @Override
@@ -230,6 +302,11 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
         addOptionalField(builder, DatafeedConfig.INDICES, indices);
         if (queryProvider != null) {
             builder.field(DatafeedConfig.QUERY.getPreferredName(), queryProvider.getQuery());
+        }
+        addOptionalField(builder, DatafeedConfig.ESQL_QUERY, esqlQuery);
+        addOptionalField(builder, DatafeedConfig.SOURCE_TIME_FIELD, sourceTimeField);
+        if (groupingInterval != null) {
+            builder.field(DatafeedConfig.GROUPING_INTERVAL.getPreferredName(), groupingInterval.getStringRep());
         }
         if (aggProvider != null) {
             builder.field(DatafeedConfig.AGGREGATIONS.getPreferredName(), aggProvider.getAggs());
@@ -251,6 +328,10 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
             builder.endObject();
         }
         addOptionalField(builder, SearchSourceBuilder.RUNTIME_MAPPINGS_FIELD, runtimeMappings);
+        addOptionalField(builder, DatafeedConfig.PROJECT_ROUTING, projectRouting);
+        if (forceRekeying != null) {
+            builder.field(FORCE_REKEYING.getPreferredName(), forceRekeying);
+        }
         builder.endObject();
         return builder;
     }
@@ -285,8 +366,32 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
         return runtimeMappings;
     }
 
+    public String getProjectRouting() {
+        return projectRouting;
+    }
+
+    public Boolean getForceRekeying() {
+        return forceRekeying;
+    }
+
     Map<String, Object> getQuery() {
         return queryProvider == null ? null : queryProvider.getQuery();
+    }
+
+    public String getEsqlQuery() {
+        return esqlQuery;
+    }
+
+    public Optional<Tuple<TransportVersion, String>> minRequiredTransportVersion() {
+        if (esqlQuery != null || sourceTimeField != null || groupingInterval != null) {
+            return Optional.of(
+                new Tuple<>(
+                    DatafeedConfig.ML_DATAFEED_ESQL_QUERY,
+                    "datafeed update uses ES|QL datafeed fields, which requires support for ES|QL datafeed updates"
+                )
+            );
+        }
+        return Optional.empty();
     }
 
     QueryBuilder getParsedQuery(NamedXContentRegistry namedXContentRegistry) throws IOException {
@@ -338,6 +443,34 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
         if (id.equals(datafeedConfig.getId()) == false) {
             throw new IllegalArgumentException("Cannot apply update to datafeedConfig with different id");
         }
+        if (datafeedConfig.getEsqlQuery() != null && changesEsqlQueryShape()) {
+            throw ExceptionsHelper.badRequestException(
+                Messages.getMessage(Messages.DATAFEED_ESQL_UPDATE_QUERY_SHAPE_IMMUTABLE, datafeedConfig.getId())
+            );
+        }
+        if (datafeedConfig.getEsqlQuery() == null && esqlQuery != null) {
+            throw ExceptionsHelper.badRequestException(
+                Messages.getMessage(Messages.DATAFEED_ESQL_UPDATE_ADD_QUERY_NOT_ALLOWED, datafeedConfig.getId())
+            );
+        }
+        if (datafeedConfig.getEsqlQuery() == null) {
+            if (sourceTimeField != null) {
+                throw ExceptionsHelper.badRequestException(
+                    Messages.getMessage(
+                        Messages.DATAFEED_CONFIG_FIELD_REQUIRES_ESQL_QUERY,
+                        DatafeedConfig.SOURCE_TIME_FIELD.getPreferredName()
+                    )
+                );
+            }
+            if (groupingInterval != null) {
+                throw ExceptionsHelper.badRequestException(
+                    Messages.getMessage(
+                        Messages.DATAFEED_CONFIG_FIELD_REQUIRES_ESQL_QUERY,
+                        DatafeedConfig.GROUPING_INTERVAL.getPreferredName()
+                    )
+                );
+            }
+        }
 
         DatafeedConfig.Builder builder = new DatafeedConfig.Builder(datafeedConfig);
         if (jobId != null) {
@@ -383,10 +516,25 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
         if (runtimeMappings != null) {
             builder.setRuntimeMappings(runtimeMappings);
         }
+        if (projectRouting != null) {
+            builder.setProjectRouting(projectRouting);
+        }
         if (headers.isEmpty() == false) {
             builder.setHeaders(ClientHelper.getPersistableSafeSecurityHeaders(headers, clusterState));
         }
         return builder.build();
+    }
+
+    private boolean changesEsqlQueryShape() {
+        return esqlQuery != null
+            || sourceTimeField != null
+            || groupingInterval != null
+            || indices != null
+            || queryProvider != null
+            || aggProvider != null
+            || scrollSize != null
+            || indicesOptions != null
+            || runtimeMappings != null;
     }
 
     /**
@@ -412,6 +560,9 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
             && Objects.equals(this.queryDelay, that.queryDelay)
             && Objects.equals(this.indices, that.indices)
             && Objects.equals(this.queryProvider, that.queryProvider)
+            && Objects.equals(this.esqlQuery, that.esqlQuery)
+            && Objects.equals(this.sourceTimeField, that.sourceTimeField)
+            && Objects.equals(this.groupingInterval, that.groupingInterval)
             && Objects.equals(this.scrollSize, that.scrollSize)
             && Objects.equals(this.aggProvider, that.aggProvider)
             && Objects.equals(this.delayedDataCheckConfig, that.delayedDataCheckConfig)
@@ -419,7 +570,9 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
             && Objects.equals(this.chunkingConfig, that.chunkingConfig)
             && Objects.equals(this.maxEmptySearches, that.maxEmptySearches)
             && Objects.equals(this.indicesOptions, that.indicesOptions)
-            && Objects.equals(this.runtimeMappings, that.runtimeMappings);
+            && Objects.equals(this.runtimeMappings, that.runtimeMappings)
+            && Objects.equals(this.projectRouting, that.projectRouting)
+            && Objects.equals(this.forceRekeying, that.forceRekeying);
     }
 
     @Override
@@ -431,6 +584,9 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
             queryDelay,
             indices,
             queryProvider,
+            esqlQuery,
+            sourceTimeField,
+            groupingInterval,
             scrollSize,
             aggProvider,
             scriptFields,
@@ -438,7 +594,9 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
             delayedDataCheckConfig,
             maxEmptySearches,
             indicesOptions,
-            runtimeMappings
+            runtimeMappings,
+            projectRouting,
+            forceRekeying
         );
     }
 
@@ -447,11 +605,50 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
         return Strings.toString(this);
     }
 
+    /**
+     * Returns {@code true} when the caller explicitly changes {@code project_routing} on this update request.
+     * Evaluated against the raw update body (not migration-defaulted routing). System-applied first-re-key
+     * defaults are excluded by checking {@code defaultedProjectRoutingForMigration} at the call site.
+     *
+     * <p>Read as two clauses: (a) the update actually specifies a routing value ({@code != null}), AND (b) that
+     * value differs from what is stored. Truth table (current = stored config, rawUpdate = request body):
+     * <pre>
+     *   current      rawUpdate           result  interpretation
+     *   anything     null (omitted)      false   user didn't touch routing -&gt; not a change
+     *   null         "_alias:prod-*"     true    first-time assignment on a legacy datafeed
+     *   "_origin"    "_origin" (same)    false   user re-sent identical value -&gt; no-op
+     *   "_origin"    "_alias:prod-*"     true    genuine re-target (widen/narrow)
+     * </pre>
+     */
+    public static boolean isUserInitiatedProjectRoutingChange(DatafeedConfig current, DatafeedUpdate rawUpdate) {
+        return rawUpdate.getProjectRouting() != null && Objects.equals(rawUpdate.getProjectRouting(), current.getProjectRouting()) == false;
+    }
+
+    /**
+     * Returns {@code true} when this update changes index routing inputs that can alter whether a datafeed
+     * participates in cross-project search and therefore whether an internal cloud credential is required.
+     */
+    public boolean affectsCrossProjectSearchSurface(DatafeedConfig current) {
+        if (projectRouting != null && Objects.equals(projectRouting, current.getProjectRouting()) == false) {
+            return true;
+        }
+        if (indices != null && Objects.equals(indices, current.getIndices()) == false) {
+            return true;
+        }
+        if (indicesOptions != null && Objects.equals(indicesOptions, current.getIndicesOptions()) == false) {
+            return true;
+        }
+        return false;
+    }
+
     boolean isNoop(DatafeedConfig datafeed) {
         return (frequency == null || Objects.equals(frequency, datafeed.getFrequency()))
             && (queryDelay == null || Objects.equals(queryDelay, datafeed.getQueryDelay()))
             && (indices == null || Objects.equals(indices, datafeed.getIndices()))
             && (queryProvider == null || Objects.equals(queryProvider.getQuery(), datafeed.getQuery()))
+            && (esqlQuery == null || Objects.equals(esqlQuery, datafeed.getEsqlQuery()))
+            && (sourceTimeField == null || Objects.equals(sourceTimeField, datafeed.getSourceTimeField()))
+            && (groupingInterval == null || Objects.equals(groupingInterval, datafeed.getGroupingInterval()))
             && (scrollSize == null || Objects.equals(scrollSize, datafeed.getScrollSize()))
             && (aggProvider == null || Objects.equals(aggProvider.getAggs(), datafeed.getAggregations()))
             && (scriptFields == null || Objects.equals(scriptFields, datafeed.getScriptFields()))
@@ -461,7 +658,8 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
                 || Objects.equals(maxEmptySearches, datafeed.getMaxEmptySearches())
                 || (maxEmptySearches == -1 && datafeed.getMaxEmptySearches() == null))
             && (indicesOptions == null || Objects.equals(indicesOptions, datafeed.getIndicesOptions()))
-            && (runtimeMappings == null || Objects.equals(runtimeMappings, datafeed.getRuntimeMappings()));
+            && (runtimeMappings == null || Objects.equals(runtimeMappings, datafeed.getRuntimeMappings()))
+            && (projectRouting == null || Objects.equals(projectRouting, datafeed.getProjectRouting()));
     }
 
     public static class Builder {
@@ -472,6 +670,9 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
         private TimeValue frequency;
         private List<String> indices;
         private QueryProvider queryProvider;
+        private String esqlQuery;
+        private String sourceTimeField;
+        private TimeValue groupingInterval;
         private AggProvider aggProvider;
         private List<SearchSourceBuilder.ScriptField> scriptFields;
         private Integer scrollSize;
@@ -480,6 +681,8 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
         private Integer maxEmptySearches;
         private IndicesOptions indicesOptions;
         private Map<String, Object> runtimeMappings;
+        private String projectRouting;
+        private Boolean forceRekeying;
 
         public Builder() {}
 
@@ -494,6 +697,9 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
             this.frequency = config.frequency;
             this.indices = config.indices;
             this.queryProvider = config.queryProvider;
+            this.esqlQuery = config.esqlQuery;
+            this.sourceTimeField = config.sourceTimeField;
+            this.groupingInterval = config.groupingInterval;
             this.aggProvider = config.aggProvider;
             this.scriptFields = config.scriptFields;
             this.scrollSize = config.scrollSize;
@@ -502,6 +708,8 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
             this.maxEmptySearches = config.maxEmptySearches;
             this.indicesOptions = config.indicesOptions;
             this.runtimeMappings = config.runtimeMappings != null ? new HashMap<>(config.runtimeMappings) : null;
+            this.projectRouting = config.projectRouting;
+            this.forceRekeying = config.forceRekeying;
         }
 
         public Builder setId(String datafeedId) {
@@ -531,6 +739,21 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
 
         public Builder setQuery(QueryProvider query) {
             this.queryProvider = query;
+            return this;
+        }
+
+        public Builder setEsqlQuery(String esqlQuery) {
+            this.esqlQuery = esqlQuery;
+            return this;
+        }
+
+        public Builder setSourceTimeField(String sourceTimeField) {
+            this.sourceTimeField = sourceTimeField;
+            return this;
+        }
+
+        public Builder setGroupingInterval(TimeValue groupingInterval) {
+            this.groupingInterval = groupingInterval;
             return this;
         }
 
@@ -602,6 +825,16 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
             return this;
         }
 
+        public Builder setProjectRouting(String projectRouting) {
+            this.projectRouting = projectRouting;
+            return this;
+        }
+
+        public Builder setForceRekeying(Boolean forceRekeying) {
+            this.forceRekeying = forceRekeying;
+            return this;
+        }
+
         public DatafeedUpdate build() {
             return new DatafeedUpdate(
                 id,
@@ -610,6 +843,9 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
                 frequency,
                 indices,
                 queryProvider,
+                esqlQuery,
+                sourceTimeField,
+                groupingInterval,
                 aggProvider,
                 scriptFields,
                 scrollSize,
@@ -617,7 +853,9 @@ public class DatafeedUpdate implements Writeable, ToXContentObject {
                 delayedDataCheckConfig,
                 maxEmptySearches,
                 indicesOptions,
-                runtimeMappings
+                runtimeMappings,
+                projectRouting,
+                forceRekeying
             );
         }
     }

@@ -280,7 +280,7 @@ abstract class MlNativeDataFrameAnalyticsIntegTestCase extends MlNativeIntegTest
 
     protected void assertStoredProgressHits(String jobId, int hitCount) {
         assertHitCount(
-            prepareSearch(AnomalyDetectorsIndex.jobStateIndexPattern()).setQuery(
+            prepareSearch(AnomalyDetectorsIndex.jobStateIndexPatterns()).setQuery(
                 QueryBuilders.idsQuery().addIds(StoredProgress.documentId(jobId))
             ),
             hitCount
@@ -303,7 +303,7 @@ abstract class MlNativeDataFrameAnalyticsIntegTestCase extends MlNativeIntegTest
             // If the job is stopped during writing_results phase and it is then restarted, there is a chance two trained models
             // were persisted as there is no way currently for the process to be certain the model was persisted.
             searchResponse -> assertThat(
-                "Hits were: " + Strings.toString(searchResponse.getHits()),
+                "Hits were: " + Strings.toTruncatedString(searchResponse.getHits()),
                 searchResponse.getHits().getHits(),
                 is(arrayWithSize(modelHitsArraySizeMatcher))
             )
@@ -451,7 +451,7 @@ abstract class MlNativeDataFrameAnalyticsIntegTestCase extends MlNativeIntegTest
 
     protected static void assertModelStatePersisted(String stateDocId) {
         assertHitCount(
-            prepareSearch(AnomalyDetectorsIndex.jobStateIndexPattern()).setQuery(QueryBuilders.idsQuery().addIds(stateDocId)),
+            prepareSearch(AnomalyDetectorsIndex.jobStateIndexPatterns()).setQuery(QueryBuilders.idsQuery().addIds(stateDocId)),
             1
         );
     }

@@ -76,7 +76,7 @@ public class BytesRefSwissHashTests extends ESTestCase {
         BytesRef[] v = values.toArray(new BytesRef[0]);
 
         TestRecycler recycler = new TestRecycler();
-        CircuitBreaker breaker = new NoopCircuitBreaker("test");
+        CircuitBreaker breaker = NoopCircuitBreaker.INSTANCE;
         BigArrays bigArrays = new MockBigArrays(recycler, ByteSizeValue.ofBytes(Long.MAX_VALUE));
         BytesRef scratch = new BytesRef();
 
@@ -133,7 +133,7 @@ public class BytesRefSwissHashTests extends ESTestCase {
         BytesRef[] right = rightValues.toArray(new BytesRef[0]);
 
         TestRecycler recycler = new TestRecycler();
-        CircuitBreaker breaker = new NoopCircuitBreaker("test");
+        CircuitBreaker breaker = NoopCircuitBreaker.INSTANCE;
         BigArrays bigArrays = new MockBigArrays(recycler, ByteSizeValue.ofBytes(Long.MAX_VALUE));
 
         try (
@@ -201,7 +201,7 @@ public class BytesRefSwissHashTests extends ESTestCase {
         BytesRef value = randomValues(1).iterator().next();
 
         TestRecycler recycler = new TestRecycler();
-        CircuitBreaker breaker = new NoopCircuitBreaker("test");
+        CircuitBreaker breaker = NoopCircuitBreaker.INSTANCE;
         BigArrays bigArrays = new MockBigArrays(recycler, ByteSizeValue.ofBytes(Long.MAX_VALUE));
 
         try (BytesRefSwissHash hash = new BytesRefSwissHash(recycler, breaker, bigArrays)) {
@@ -218,12 +218,17 @@ public class BytesRefSwissHashTests extends ESTestCase {
 
     public void testEmpty() {
         TestRecycler recycler = new TestRecycler();
-        CircuitBreaker breaker = new NoopCircuitBreaker("test");
+        CircuitBreaker breaker = NoopCircuitBreaker.INSTANCE;
         BigArrays bigArrays = new MockBigArrays(recycler, ByteSizeValue.ofBytes(Long.MAX_VALUE));
         try (BytesRefSwissHash hash = new BytesRefSwissHash(recycler, breaker, bigArrays)) {
             assertThat(hash.size(), equalTo(0L));
             assertFalse(hash.iterator().next());
         }
+    }
+
+    public void testConsistentHash() {
+        BytesRef value = new BytesRef(randomByteArrayOfLength(between(1, 1024)));
+        assertEquals(BytesRefSwissHash.hash64(value), BytesRefSwissHash.hash64(value.bytes, value.offset, value.length));
     }
 
     private void assertStatus(BytesRefSwissHash hash) {
@@ -300,7 +305,11 @@ public class BytesRefSwissHashTests extends ESTestCase {
         SINGLE_VALUE {
             @Override
             long add(BytesRefSwissHash hash, BytesRef value) {
-                return hash.add(value);
+                if (randomBoolean()) {
+                    return hash.add(value);
+                } else {
+                    return hash.addWithHash(value, BytesRefSwissHash.hash64(value.bytes, value.offset, value.length));
+                }
             }
 
             @Override

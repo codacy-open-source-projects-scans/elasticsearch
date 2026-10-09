@@ -9,6 +9,7 @@ package org.elasticsearch.xpack.ilm;
 import org.apache.lucene.util.SetOnce;
 import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.client.internal.OriginSettingClient;
+import org.elasticsearch.cluster.metadata.IndexMetadata;
 import org.elasticsearch.cluster.metadata.Metadata;
 import org.elasticsearch.cluster.node.DiscoveryNodes;
 import org.elasticsearch.common.settings.Setting;
@@ -99,6 +100,7 @@ public class IndexLifecycle extends Plugin implements ActionPlugin, HealthPlugin
     private final SetOnce<ILMHistoryStore> ilmHistoryStore = new SetOnce<>();
     private final SetOnce<IlmHealthIndicatorService> ilmHealthIndicatorService = new SetOnce<>();
     private final SetOnce<ReservedLifecycleAction> reservedLifecycleAction = new SetOnce<>();
+    private final SetOnce<TimeSeriesEligibleWriteWindowLocatorWithIlm> timeSeriesEligibleWriteWindowLocator = new SetOnce<>();
     private final Settings settings;
 
     public IndexLifecycle(Settings settings) {
@@ -120,7 +122,7 @@ public class IndexLifecycle extends Plugin implements ActionPlugin, HealthPlugin
             LifecycleSettings.LIFECYCLE_STEP_MASTER_TIMEOUT_SETTING,
             LifecycleSettings.LIFECYCLE_STEP_WAIT_TIME_THRESHOLD_SETTING,
             LifecycleSettings.LIFECYCLE_ROLLOVER_ONLY_IF_HAS_DOCUMENTS_SETTING,
-            LifecycleSettings.LIFECYCLE_SKIP_SETTING,
+            IndexMetadata.LIFECYCLE_SKIP_SETTING,
             RolloverAction.LIFECYCLE_ROLLOVER_ALIAS_SETTING,
             IlmHealthIndicatorService.MAX_TIME_ON_ACTION_SETTING,
             IlmHealthIndicatorService.MAX_TIME_ON_STEP_SETTING,
@@ -150,7 +152,8 @@ public class IndexLifecycle extends Plugin implements ActionPlugin, HealthPlugin
             services.clusterService(),
             services.threadPool(),
             services.client(),
-            services.xContentRegistry()
+            services.xContentRegistry(),
+            services.featureService()
         );
         ilmTemplateRegistry.initialize();
         ilmHistoryStore.set(
@@ -178,7 +181,8 @@ public class IndexLifecycle extends Plugin implements ActionPlugin, HealthPlugin
                 nowSupplier,
                 services.xContentRegistry(),
                 ilmHistoryStore.get(),
-                getLicenseState()
+                getLicenseState(),
+                services.dataStreamLifecycleSettings()
             )
         );
         components.add(indexLifecycleInitialisationService.get());
@@ -189,13 +193,16 @@ public class IndexLifecycle extends Plugin implements ActionPlugin, HealthPlugin
                 new IlmHealthIndicatorService.StagnatingIndicesFinder(
                     services.clusterService(),
                     IlmHealthIndicatorService.RULES_BY_ACTION_CONFIG.values(),
-                    System::currentTimeMillis
+                    System::currentTimeMillis,
+                    services.dataStreamLifecycleSettings()
                 )
             )
         );
         reservedLifecycleAction.set(
             new ReservedLifecycleAction(services.xContentRegistry(), services.client(), XPackPlugin.getSharedLicenseState())
         );
+        timeSeriesEligibleWriteWindowLocator.set(new TimeSeriesEligibleWriteWindowLocatorWithIlm());
+        components.add(timeSeriesEligibleWriteWindowLocator.get());
 
         return components;
     }

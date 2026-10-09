@@ -37,6 +37,8 @@ import java.util.function.Supplier;
 
 public class OTelPlugin extends Plugin implements ActionPlugin {
 
+    public static final FeatureFlag METRIC_EXEMPLARS_FEATURE_FLAG = new FeatureFlag("metric_exemplars");
+
     // OTEL_DATA_REGISTRY_ENABLED controls enabling the index template registry.
     //
     // This setting will be ignored if the plugin is disabled.
@@ -62,8 +64,6 @@ public class OTelPlugin extends Plugin implements ActionPlugin {
 
     private static final Logger logger = LogManager.getLogger(OTelPlugin.class);
 
-    private static final boolean OTLP_TRACES_ENABLED = new FeatureFlag("otlp_traces").isEnabled();
-    private static final boolean OTLP_LOGS_ENABLED = new FeatureFlag("otlp_logs").isEnabled();
     private final SetOnce<OTelIndexTemplateRegistry> registry = new SetOnce<>();
     private final SetOnce<IndexingPressure> indexingPressure = new SetOnce<>();
     private final boolean enabled;
@@ -80,16 +80,15 @@ public class OTelPlugin extends Plugin implements ActionPlugin {
         Supplier<DiscoveryNodes> nodesInCluster,
         Predicate<NodeFeature> clusterSupportsFeature
     ) {
-        assert indexingPressure.get() != null : "indexing pressure must be set";
-        List<RestHandler> handlers = new ArrayList<>(3);
-        handlers.add(new OTLPMetricsRestAction(indexingPressure.get(), maxProtobufContentLengthBytes));
-        if (OTLP_TRACES_ENABLED) {
+        if (enabled) {
+            assert indexingPressure.get() != null : "indexing pressure must be set";
+            List<RestHandler> handlers = new ArrayList<>(3);
+            handlers.add(new OTLPMetricsRestAction(indexingPressure.get(), maxProtobufContentLengthBytes));
             handlers.add(new OTLPTracesRestAction(indexingPressure.get(), maxProtobufContentLengthBytes));
-        }
-        if (OTLP_LOGS_ENABLED) {
             handlers.add(new OTLPLogsRestAction(indexingPressure.get(), maxProtobufContentLengthBytes));
+            return handlers;
         }
-        return handlers;
+        return List.of();
     }
 
     @Override
@@ -99,7 +98,14 @@ public class OTelPlugin extends Plugin implements ActionPlugin {
         ClusterService clusterService = services.clusterService();
         indexingPressure.set(services.indexingPressure());
         registry.set(
-            new OTelIndexTemplateRegistry(settings, clusterService, services.threadPool(), services.client(), services.xContentRegistry())
+            new OTelIndexTemplateRegistry(
+                settings,
+                clusterService,
+                services.threadPool(),
+                services.client(),
+                services.xContentRegistry(),
+                services.featureService()
+            )
         );
         if (enabled) {
             OTelIndexTemplateRegistry registryInstance = registry.get();
@@ -123,12 +129,8 @@ public class OTelPlugin extends Plugin implements ActionPlugin {
     public Collection<ActionHandler> getActions() {
         List<ActionHandler> handlers = new ArrayList<>(3);
         handlers.add(new ActionHandler(OTLPMetricsTransportAction.TYPE, OTLPMetricsTransportAction.class));
-        if (OTLP_TRACES_ENABLED) {
-            handlers.add(new ActionHandler(OTLPTracesTransportAction.TYPE, OTLPTracesTransportAction.class));
-        }
-        if (OTLP_LOGS_ENABLED) {
-            handlers.add(new ActionHandler(OTLPLogsTransportAction.TYPE, OTLPLogsTransportAction.class));
-        }
+        handlers.add(new ActionHandler(OTLPTracesTransportAction.TYPE, OTLPTracesTransportAction.class));
+        handlers.add(new ActionHandler(OTLPLogsTransportAction.TYPE, OTLPLogsTransportAction.class));
         return handlers;
     }
 }
