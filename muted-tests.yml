@@ -108,9 +108,6 @@ tests:
 - class: org.elasticsearch.xpack.esql.CsvIT
   method: test {csv-spec:k8s-timeseries-increase.increase_of_double_no_grouping_promql}
   issue: https://github.com/elastic/elasticsearch/issues/150045
-- class: org.elasticsearch.xpack.esql.heap_attack.HeapAttackIT
-  method: testGroupOnManyLongs
-  issue: https://github.com/elastic/elasticsearch/issues/150104
 - class: org.elasticsearch.repositories.gcs.GoogleCloudStorageBlobContainerRetriesTests
   method: testWriteLargeBlob
   issue: https://github.com/elastic/elasticsearch/issues/150356
@@ -147,12 +144,6 @@ tests:
 - class: org.elasticsearch.xpack.stateless.StatelessHollowIndexShardsIT
   method: testRelocateHollowableShardWithConnectionFailure
   issue: https://github.com/elastic/elasticsearch/issues/153156
-- class: org.elasticsearch.xpack.esql.action.FromDatasetIT
-  method: testNdjsonBadDateTokenHonorsErrorPolicyMatchingColumnar
-  issue: https://github.com/elastic/elasticsearch/issues/153158
-- class: org.elasticsearch.xpack.esql.action.FromDatasetIT
-  method: testColumnarBadDateTokenNullsCellEagerAndDeferred
-  issue: https://github.com/elastic/elasticsearch/issues/153187
 - class: org.elasticsearch.xpack.stateless.reshard.StatelessReshardIT
   method: testTermVectorsApiRealtimeGet
   issue: https://github.com/elastic/elasticsearch/issues/153282
@@ -637,3 +628,17 @@ tests:
 - class: org.elasticsearch.xpack.esql.qa.ndjson.NdJsonCompressedFormatSpecIT
   method: test {csv-spec:external-multifile.multiFileSalaryStats [ndjson.gz/S3]}
   issue: https://github.com/elastic/elasticsearch/issues/161557
+- class: org.elasticsearch.xpack.logsdb.LogsdbTestSuiteIT
+  method: test {yaml=/37_columnar_collapse/collapse on a single valued columnar keyword field with the columnar codec disabled}
+  issue: https://github.com/elastic/elasticsearch/issues/161603
+- class: org.elasticsearch.xpack.logsdb.LogsdbTestSuiteIT
+  method: test {yaml=/37_columnar_collapse/collapse on a columnar keyword field with the columnar codec disabled}
+  issue: https://github.com/elastic/elasticsearch/issues/161604
+- class: org.elasticsearch.xpack.esql.ccq.MultiClusterSpecFuseIT
+  method: test {csv-spec:fuse.fuseWithRowLinearAndMultiValueScoreColumn}
+  issue: https://github.com/elastic/elasticsearch/issues/161607
+- class: org.elasticsearch.datastreams.DataStreamsClientYamlTestSuiteIT
+  issue: https://github.com/elastic/elasticsearch/issues/161608
+- class: org.elasticsearch.xpack.esql.datasource.parquet.OptimizedParquetColumnIteratorReadinessTests
+  method: testNoMatchReleasesGroupReservation
+  issue: https://github.com/elastic/elasticsearch/issues/161623
